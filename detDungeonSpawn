@@ -1,0 +1,281 @@
+local dungeons = {}
+local despawnRadius = 500
+local dungeonBaseSize = 64
+
+local replicatedStorage = game:GetService('ReplicatedStorage')
+local serverScriptService = game:GetService('ServerScriptService')
+local playerService = game:GetService('Players')
+
+local terrain = require(replicatedStorage.Modules.terrainGeneration.terrain)
+local biomes = require(replicatedStorage.Modules.terrainGeneration.biomes)
+local chests = require(serverScriptService.Core.chests)
+local enemyAPI = require(serverScriptService.API.enemyAPI)
+local mobs = require(serverScriptService.API.enemyAPI.mobs)
+
+local dungeonsFolder = replicatedStorage.Assets.Template.Dungeons
+local dungeonTemplates = dungeonsFolder:GetChildren()
+
+local dungeonsList = {}
+
+--> for linking dungeon to biome
+local dungeonCategories = {}
+
+--> for loading dungeons
+local function loadDungeonCategoryList()
+	for _, v in dungeonTemplates do
+		local biomeAttr = v:GetAttribute("biome")
+		if not biomeAttr then continue end
+
+		for biome in string.gmatch(biomeAttr, "([^:]+)") do
+			if dungeonCategories[biome] == nil then
+				dungeonCategories[biome] = {}
+			end
+			table.insert(dungeonCategories[biome], v)
+		end
+	end
+end
+loadDungeonCategoryList()
+
+--[[
+get dungeon hash
+]]
+local function hash(x, z, seed)
+	return math.abs(math.sin(x * 12.9898 + z * 78.233 + seed * 0.5)) % 1
+end
+
+local function getDistanceFromSpawn(x, z)
+	return math.sqrt(x * x + z * z)
+end
+
+local function getDifficultyBias(distance)
+	local maxDistance = 2000
+	local t = math.clamp(distance / maxDistance, 0, 1)
+
+	return t ^ 1.5
+end
+
+local function getDungeonByPos(x, z)
+	local height, biomeName = biomes.getYPosWithBiome(x, z, 64)
+	local biomeDungeons = dungeonCategories[biomeName]
+	if not biomeDungeons or #biomeDungeons == 0 then
+		print(`nil dungeon for {biomeName}`)
+		return nil
+	end
+
+	local distance = getDistanceFromSpawn(x, z)
+	local difficultyBias = getDifficultyBias(distance)
+
+	local weightedList = {}
+	local totalWeight = 0
+
+	for _, dungeon in biomeDungeons do
+		local difficulty = dungeon:GetAttribute("difficulty") or 1
+		local weight = (difficulty ^ 2) * difficultyBias + 1 
+		table.insert(weightedList, {
+			ref = dungeon,
+			weight = weight
+		})
+		totalWeight += weight
+	end
+
+	local rand = hash(x, z, 999)
+	local target = rand * totalWeight
+	local cumulative = 0
+
+	for _, entry in weightedList do
+		cumulative += entry.weight
+		if target <= cumulative then
+			return entry.ref
+		end
+	end
+
+	return weightedList[#weightedList].ref
+end
+
+function dungeons.despawnDungeon(dungeonObject : Model)
+	if not dungeonObject then return end
+	local posValue = dungeonObject:FindFirstChild('GridPosition')
+	if not posValue then warn('Position corrupted, handling error? - Dungeons') return end
+
+	local x = posValue.Value.X
+	local z = posValue.Value.Z
+
+	if  (dungeonsList[x] and dungeonsList[x][z]) == nil then warn('despawning nil dungeon?') return end
+	
+	enemyAPI.deactivateEnemies(dungeonObject)
+	
+	dungeonsList[x][z] = nil
+	dungeonObject.Parent = nil
+end
+
+--[[
+
+TODO
+
+]]
+function dungeons.restartDungeon(dungeonObject : Model)
+	if not dungeonObject then return end
+	
+	
+	
+end
+
+local function checkIfPlayersInRadius(centrePos : Vector3, radius : number) : boolean?
+	for _, player in playerService:GetPlayers() do
+		local char = player.Character
+		if not char then continue end
+		
+		local hrp = char:FindFirstChild('HumanoidRootPart')
+		if not hrp then continue end
+		
+		local distance = (hrp.Position - centrePos).Magnitude
+		if distance < radius then return true end
+	end
+	return
+end
+
+local function monitorDungeon(dungeonObject)
+	local dungeonPos = dungeonObject:WaitForChild('GridPosition')
+	local dungeonPosCentre = Vector3.new(
+		dungeonPos.Value.X,
+		dungeonPos.Value.Y,
+		dungeonPos.Value.Z
+	)
+	task.spawn(function()
+		while task.wait(10) do --every x secs, increase to reduce strain
+			local dontDespawn = checkIfPlayersInRadius(dungeonPosCentre, despawnRadius)
+			if dontDespawn then continue end
+			
+			dungeons.despawnDungeon(dungeonObject)
+			
+			break
+		end
+	end)
+end
+
+local function distanceDecay(distance : number) : number
+	assert(distance, `yo skid wat r u doing how this even possible - this is edited by oliver btw get good toby stupid skid elol skibidi`)
+	return 0.7 / ((distance / 100 + 1) ^ 1.4)
+end
+
+function dungeons.maybeSpawnChest(chestSpawn : Instance, decayRate : number) : Instance?
+	if chestSpawn:IsA('Part') == false then warn('chest spawns needa be parts!') return end
+	chestSpawn.Transparency = 1
+	if math.random() < decayRate then return end --rarer further away
+	
+	return chests:SpawnRandomChest(decayRate, chestSpawn.CFrame)
+end
+
+function dungeons.spawnDungeon(vec2Pos : Vector2) : ()
+	if not vec2Pos then return end
+	
+	--> declare x/z pos
+	local x = vec2Pos.X
+	local z = vec2Pos.Y
+	
+	if dungeonsList[x] and dungeonsList[x][z] then return end --one dungeon spawn max per loc
+	
+	local y = terrain.getYPos(x,z,64)
+	local dungeonTemplate = getDungeonByPos(x,z) --> miscellaneous ahh 4 maybe decouple later
+	if y == nil then
+		warn('nil y for spawnDungeon, maybe check terrain getYPos is busted - u stupih')
+		return
+	end
+	
+	local distance = vec2Pos.Magnitude
+	local decayRate = distanceDecay(distance)
+	
+	--> ABSTRACT HERE FOR DET. GEN
+	local genVal = (math.noise(0.005 * x, 0.005 * z, 67) + 1) / 2 --> ratio 0-1
+	local indexValue = math.clamp(math.floor(genVal * (#dungeonTemplates - 1)) + 1, 1, #dungeonTemplates)
+	
+	local newDungeon = dungeonTemplate and dungeonTemplate:Clone() :: Model
+	if not newDungeon then warn('nil dungeon') return end
+	
+	local chestSpawns = newDungeon:FindFirstChild('ChestSpawn') and newDungeon.ChestSpawn:GetChildren()
+	
+--[[
+	if not chestSpawns then
+		warn(`dungeon template has not chest spawns : {newDungeon.Name}`)
+	end
+]]
+	
+	for _, v in newDungeon:GetDescendants() do
+		if v:IsA('BasePart') or v:IsA('Decal') then
+			v.Transparency = 1
+		end
+	end
+	
+	--dungeon passed checks so list it up
+	if dungeonsList[x] == nil then dungeonsList[x] = {} end
+	dungeonsList[x][z] = newDungeon
+	
+	local base = newDungeon:FindFirstChild('Base')
+	
+	
+	--slap it in place hwatushhhhh *slap sound*
+	newDungeon.Parent = workspace.Dungeons
+	newDungeon:PivotTo(
+		CFrame.new( 
+			Vector3.new(
+				x,
+				math.clamp(y + newDungeon:GetExtentsSize().Y/2 + 32, 0, 1500 ),
+				z
+			) + (
+				newDungeon:GetAttribute('offset')
+				or vector.zero
+			) 
+		) 
+	)
+	
+	if base then
+
+		local originalSize = base.Size
+		local heightDiff = dungeonBaseSize - originalSize.Y
+		local newSize = Vector3.new(
+			originalSize.X,
+			dungeonBaseSize,
+			originalSize.Z
+		)
+		local originalPosition = base.Position
+		local newPosition = Vector3.new(
+			originalPosition.X,
+			originalPosition.Y - heightDiff/2,
+			originalPosition.Z
+		)
+
+		base.Size = newSize
+		base.Position = newPosition
+
+	end
+	
+	chestSpawns = chestSpawns or {}
+	for _, part in chestSpawns do
+		local chest = dungeons.maybeSpawnChest(part, decayRate)
+		if chest then chest.Parent = newDungeon end
+	end
+	
+	local posInstance = Instance.new('Vector3Value')
+	posInstance.Name = 'GridPosition'
+	posInstance.Value = Vector3.new(x,y,z)
+	posInstance.Parent = newDungeon
+	
+	enemyAPI.activateEnemies(newDungeon)
+	monitorDungeon(newDungeon)
+	
+	--> now we 'glitter' with mobs
+	
+	for i=1, math.random(0,2) do
+		local xOffset = math.random(40,80) * (math.random()>.5 and -1 or 1)
+		local zOffset = math.random(40,80) * (math.random()>.5 and -1 or 1)
+
+		--> TODO; add weight random for mob id (freeroam -> hostile class)
+		mobs.SpawnEntity(x+xOffset, z+zOffset, 1)
+	end
+	
+	return
+end
+
+
+
+return dungeons
