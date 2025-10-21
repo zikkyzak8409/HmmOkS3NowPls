@@ -1,0 +1,189 @@
+--[[
+This is dungeon pathfinding, specifically for easily managing hundreds of enemies pathfinding at the same time
+]]
+
+local attackDistances = {
+	Default = 5,
+	Ranged = 15
+}
+
+--[[
+
+
+]]
+local target = {}
+local walkPool = {}
+
+local replicatedStorage = game:GetService('ReplicatedStorage')
+local playerService = game:GetService('Players')
+local runService = game:GetService('RunService')
+
+local attackAPI = require(script.Parent.enemyAttack)
+
+--TODO; refactor later to be spatial
+function target.getActivePlayerRootsOrderedByDistance(originPosition : Vector3)
+	local roots = {}
+
+	for _, player in playerService:GetPlayers() do
+		local char = player.Character
+		if not (char and char:FindFirstChild("HumanoidRootPart")) then continue end
+
+		--> bruh table.insert rlly is faster
+		table.insert(roots, char.HumanoidRootPart)
+	end
+
+	table.sort(roots, function(a, b)
+		return (a.Position - originPosition).Magnitude < (b.Position - originPosition).Magnitude
+	end)
+
+	return roots
+end
+
+--[[
+elementary decoupling procedure
+]]
+function target.checkIfVisible(rigModel : Model, targModel : Model)
+	if not (rigModel and targModel) then return false end
+
+	local mainRoot = rigModel:FindFirstChild('HumanoidRootPart')
+	local targRoot = targModel:FindFirstChild('HumanoidRootPart')
+	if not (mainRoot and targRoot) then return false end
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = {rigModel}
+
+	local direction = targRoot.Position - mainRoot.Position
+	local result = workspace:Raycast(mainRoot.Position, direction, raycastParams)
+
+	if result == nil then
+		return true
+	end
+
+	if result.Instance:IsDescendantOf(targModel) then
+		return true
+	end
+
+	return false
+end
+
+--> this is overkill TODO; fix
+function target.findNearestVisiblePlayer(rootPosition: Vector3, character: Model)
+	local rootsOrdered = target.getActivePlayerRootsOrderedByDistance(rootPosition)
+
+	for _, root in rootsOrdered do
+		if root.Parent == character then continue end -- skip self
+
+		local isVisible = target.checkIfVisible(character, root.Parent)
+		if isVisible then
+			return root
+		end
+	end
+
+	return nil
+end
+
+--[[
+for preventing model from walking out of bounds
+]]
+function target.bindPointWithinModel(model: Model, position: Vector3): Vector3
+	local cf, size = model:GetBoundingBox()
+
+	local relative = cf:PointToObjectSpace(position)
+
+	local clampedLocal = Vector3.new(
+		
+		math.clamp(relative.X, -size.X / 2 + 10, size.X / 2 - 10),
+		relative.Y,
+		math.clamp(relative.Z, -size.Z / 2 + 10, size.Z / 2 - 10)
+		
+	)
+
+	local clampedPosition = cf:PointToWorldSpace(clampedLocal)
+
+	return clampedPosition
+end
+
+local function canAttack(targ : BasePart?, rigRoot : BasePart?, targType : string?)
+	if not (targ and rigRoot) then warn('no targ/rigroot') return end
+	
+	local distance = (targ.Position - rigRoot.Position).Magnitude
+	if distance > attackDistances[targType] then return end
+	if rigRoot:FindFirstAncestorOfClass('Model'):GetAttribute('cooldown') then return end
+	
+	return true
+end
+
+local function attack(rig : Model, targModel : Model)
+	if not (rig and rig:IsA('Model')) then return end
+	if not targModel then return end
+	
+	return attackAPI.launchAttack(rig, targModel)
+end
+
+function target.connectPathing(entityRig,dungeonObject)
+	local humanoid = entityRig:FindFirstChildOfClass('Humanoid') :: Humanoid?
+	if not humanoid then return end
+	
+	local rig = entityRig
+	local hrp = rig:FindFirstChild('HumanoidRootPart') :: BasePart?
+	if not hrp then warn('enemy rig has no root') return end
+	
+	local animator = humanoid:FindFirstChildOfClass('Animator')
+	local walkAnim = animator and animator:LoadAnimation(script.Walk)
+	if not walkAnim then warn('cant load walk to enemy rig') return end
+	
+	walkPool[entityRig] = walkAnim
+	walkAnim.Priority = Enum.AnimationPriority.Movement
+	
+	local isActive = true
+	local targ = nil
+	
+	task.spawn(function()
+		
+		--mob pathing loop
+		
+		local targetType = entityRig:GetAttribute('targetType') or 'Default'
+		
+		while isActive and task.wait(0.1) do
+			if not targ then
+				targ = target.findNearestVisiblePlayer(rig:GetPivot().Position, rig)
+			end
+
+			if not targ then walkAnim:Stop() continue end
+			local canAttack = canAttack(targ, hrp, targetType)
+			
+			if canAttack
+				and attack(rig, targ:FindFirstAncestorOfClass('Model')) then
+				
+				walkAnim:Stop()
+				
+				task.wait(1) --> walk cooldown
+				
+				continue -->attacked
+			end
+			
+			--movement
+			
+			local normalisedPosition = target.bindPointWithinModel(dungeonObject, targ.Position)
+			humanoid.WalkToPoint = normalisedPosition
+			if not walkAnim.IsPlaying then walkAnim:Play() end
+			
+			-- re-check visibility
+			local visible = target.checkIfVisible(rig, targ.Parent)
+			if not visible then
+				targ = nil
+			end
+		end
+	end)
+	
+	
+	return {
+		Disconnect = function()
+			walkPool[entityRig] = nil --discard walk anim
+			isActive = false
+		end
+	}
+end
+
+return target
