@@ -1,0 +1,251 @@
+local serverScriptService = game:GetService('ServerScriptService')
+local runService = game:GetService('RunService')
+
+local roamAPI = require(serverScriptService.API.enemyAPI.freeroamAPI)
+local targetAPI = require(serverScriptService.API.enemyAPI.targetAPI)
+
+local mobActiveTrack = {}
+local mob = {}
+
+mob.data = {
+	
+	--> actual mob id for spawn referencing
+	id = 1,
+	
+	--> delta height betwixt le tiles that mob can climb
+	maxStepHeight = 10,
+	
+	--> despawn range is the range at which the mob can despawn beyond
+	despawnRange = 700,
+	
+	--> active range is the range at which the mob becomes 'active'
+	activeRange = 100,
+	
+	--> walk speed
+	walkSpeed = 15,
+	
+	baseDamage = 5
+}
+
+--[[
+Returns ground-level waypoints to target position, avoiding baked obstacles
+or nil
+]]
+function mob.getPathTo(
+	mobModel : Model,
+	targetPosition : Vector3
+)
+	
+	local hrp = mobModel:FindFirstChild('HumanoidRootPart')
+	local startVec2 = hrp and Vector2.new(hrp.Position.X, hrp.Position.Z)
+	if not startVec2 then return end
+	
+	local targVec2 = Vector2.new(targetPosition.X, targetPosition.Z)
+	if not targVec2 then return end
+	
+	local path = roamAPI.getPath(
+		startVec2,
+		targVec2,
+		mob.data.maxStepHeight
+	)
+	
+	if path == nil then return nil end
+	
+	for index, waypoint in path do
+		path[index] = waypoint* Vector3.new(10,1,10)
+	end
+	
+	--> return the waypoints
+	return path
+end
+
+--[[
+For when the mob is ready to despawn
+]]
+local function despawn(mobModel : Model)
+	--> if extra auth is required for despawn then add here
+	
+	--> hard despawn
+	mobModel:Destroy()
+	return
+end
+
+local function ensureTrack(mobModel : Model, animTrack)
+	local activeTrack = mobActiveTrack[mobModel]
+
+	if activeTrack ~= animTrack then
+		if activeTrack then activeTrack:Stop() end
+
+		mobActiveTrack[mobModel] = animTrack
+		animTrack:Play()
+	end
+end
+
+--[[
+STATES
+]]
+function mob.idle(mobModel : Model, animatorTracks)
+	--> ensure active track is idle
+	ensureTrack(mobModel, animatorTracks.Idle)
+	
+	--> idle for 2 sec
+	return 2
+end
+function mob.walk(mobModel: Model, animatorTracks, targetPosition: Vector3)
+
+	--> ensure walk is playing
+	ensureTrack(mobModel, animatorTracks.Walk)
+
+	local path = mob.getPathTo(mobModel, targetPosition)
+	if not path then
+		--warn('nil path')
+		return mob.idle(mobModel, animatorTracks)
+	end
+
+	local walkspeed = mob.data.walkSpeed or 8
+	local isWalking = true
+	local waypoints = path
+	local curWaypoint = 2
+
+	local hrp = mobModel:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		warn("model has no HumanoidRootPart")
+		return 0.2
+	end
+
+	local lastWaypointY = waypoints[#waypoints] and waypoints[#waypoints].Y  --> get Y of last waypoint
+	if not lastWaypointY then return .2 end
+
+	--> this is going to be seriliased and sent to the client for clint-side movement (prevent movement lag / reduce strain)
+	task.spawn(function()
+		local conn
+		conn = runService.Heartbeat:Connect(function(dt)
+			if not isWalking then
+				conn:Disconnect()
+				return
+			end
+
+			local currentPos = mobModel:GetPivot().Position
+			local targetPos
+
+			if curWaypoint > #waypoints then
+				--> after finishing last waypoint, move toward targetPosition,
+				--> but use last waypoint's Y
+				targetPos = Vector3.new(targetPosition.X, lastWaypointY, targetPosition.Z)
+			else
+				--> still on waypoints, use waypoint position as is
+				targetPos = waypoints[curWaypoint]
+			end
+
+			local direction = targetPos - currentPos
+			local distance = direction.Magnitude
+
+			if distance < 0.2 then
+				curWaypoint += 1
+				return
+			end
+
+			local moveVec = direction.Unit * walkspeed * dt
+			if moveVec.Magnitude > distance then
+				moveVec = direction
+			end
+
+			local newPos = currentPos + moveVec
+
+			mobModel:PivotTo(CFrame.lookAt(newPos, newPos + direction))
+		end)
+	end)
+
+	--> stop walking after 1 second
+	task.delay(1, function()
+		isWalking = false
+	end)
+
+	return 1
+end
+
+--[[
+Basic attack functione
+]]
+function mob.attack(mobModel : Model, animatorTracks, targetCharacter : Model)
+	
+	--> ensure attack animation
+	ensureTrack(mobModel, animatorTracks.Punch)
+	
+	local targHum = targetCharacter:FindFirstChild('Humanoid') :: Humanoid?
+	if targHum then targHum.Health -= mob.data.baseDamage end
+	
+	--> wait duration of attack anim + cooldown
+	return animatorTracks.Punch.Length + 1
+end
+
+--[[
+Where medial states r handled
+]]
+function mob.doNextAction(mobModel, mobPosition, animatorTracks)
+	if not (mobModel and mobPosition and animatorTracks) then return 1 end
+	local hum = mobModel:FindFirstChild('Humanoid') :: Humanoid?
+	if not (hum and hum.Health > 0) then return end
+	
+	--> get player characters from closest to farthest
+	local playerTargs = targetAPI.getSortedCharList(mobPosition)
+	if #playerTargs == 0 then return 10 end
+	
+	--> check if can despawn
+	local closestPlayer = playerTargs[1]
+	local closestHRP = closestPlayer and closestPlayer.Character and closestPlayer.Character:FindFirstChild('HumanoidRootPart')
+	if not closestHRP then
+		return 1
+	end
+	
+	local distanceFromClosestPlayer = (closestHRP.Position - mobPosition).Magnitude
+	if distanceFromClosestPlayer > mob.data.despawnRange then
+		return despawn(mobModel)
+	end
+	
+	--> check if can become active, else idle for 5 seconds
+	if distanceFromClosestPlayer > mob.data.activeRange then
+		return 5
+	end
+	
+	if distanceFromClosestPlayer <= 10 then
+		return mob.attack(mobModel, animatorTracks, closestPlayer.Character)
+	else
+		return mob.walk(mobModel, animatorTracks, closestHRP.Position)
+	end
+	
+end
+
+--[[
+Mob behaviour initiation
+]]
+function mob.init(mobModel, animatorTracks)
+	
+	task.spawn(function()
+		local hrp = mobModel:FindFirstChild('HumanoidRootPart')
+		if not hrp then warn('goobline has no hrp') return end
+		local hum = mobModel:FindFirstChild('Humanoid') :: Humanoid?
+		if not hum then warn('goobline has no hum') return end
+		
+		local nextCheck = .2
+		
+		while task.wait(nextCheck) do
+			
+			if hum.Health <= 0 then break end
+			
+			nextCheck = mob.doNextAction(
+				mobModel,
+				hrp and hrp.Position,
+				animatorTracks
+			)
+			
+			if not nextCheck then break end
+		end
+		
+		--> ensure despawn
+		despawn(mobModel)
+	end)
+	
+end
+
+return mob
